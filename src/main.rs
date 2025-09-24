@@ -11,6 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
 use tokio::sync::oneshot;
+// ------------- 新增 import -------------
+use tokenizers::Tokenizer;
 
 // ===== 批处理请求定义 =====
 
@@ -19,6 +21,7 @@ struct BatchRequest {
     id: String,
     model: String,
     prompt: String,
+    input_ids: Vec<u32>, // 新增：分词后的 token ids
     stream: bool,
     response_tx: Option<Sender<LLMChunk>>,
     completion_tx: Option<oneshot::Sender<String>>,
@@ -335,10 +338,11 @@ pub struct StreamChoice {
 #[derive(Clone)]
 struct AppState {
     batch_collector: Arc<BatchCollector>,
+    tokenizer: Arc<Tokenizer>, // 新增：全局共享 tokenizer
 }
 
 impl AppState {
-    fn new(worker_count: usize, batch_size: usize, batch_timeout_ms: u64) -> Self {
+    fn new(worker_count: usize, batch_size: usize, batch_timeout_ms: u64, tokenizer: Arc<Tokenizer>) -> Self {
         let (task_tx, task_rx) = channel::unbounded::<LLMTask>();
 
         // 创建批处理收集器
@@ -353,7 +357,7 @@ impl AppState {
             });
         }
 
-        AppState { batch_collector }
+        AppState { batch_collector , tokenizer}
     }
 }
 
@@ -373,8 +377,17 @@ async fn chat_completions(
         .map(|msg| format!("{}: {}", msg.role, msg.content))
         .collect::<Vec<_>>()
         .join("\n");
-    
+     // 分词（放在 spawn_blocking 避免阻塞 tokio 线程）
+    let tokenizer_arc = state.tokenizer.clone();
+    let prompt_clone = prompt.clone();
+    let encode_handle = tokio::task::spawn_blocking(move || encode_prompt(&*tokenizer_arc, &prompt_clone));
 
+    let input_ids = match encode_handle.await {
+        Ok(Ok(ids)) => ids,
+        Ok(Err(e)) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, format!("编码任务失败: {}", e)).into_response(),
+    };
+    
     if is_stream {
         // 流式响应
         let (chunk_tx, chunk_rx) = channel::unbounded::<LLMChunk>();
@@ -383,6 +396,7 @@ async fn chat_completions(
             id: request_id.clone(),
             model: request.model.clone(),
             prompt,
+            input_ids,
             stream: true,
             response_tx: Some(chunk_tx),
             completion_tx: None,
@@ -440,6 +454,7 @@ async fn chat_completions(
             id: request_id.clone(),
             model: request.model.clone(),
             prompt,
+            input_ids,
             stream: false,
             response_tx: None,
             completion_tx: Some(completion_tx),
@@ -491,6 +506,14 @@ fn generate_id() -> String {
         .as_nanos()
         .to_string()
 }
+// ===== 辅助函数 =====
+
+fn encode_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<Vec<u32>, String> {
+    tokenizer
+        .encode(prompt, true)
+        .map_err(|e| format!("tokenizer encode failed: {}", e))
+        .map(|enc| enc.get_ids().to_vec())
+}
 
 
 // ===== 主函数 =====
@@ -508,7 +531,19 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("  - 批大小: {}", batch_size);
     println!("  - 批超时: {}ms", batch_timeout_ms);
 
-    let app_state = AppState::new(worker_count, batch_size, batch_timeout_ms);
+    // 指定 tokenizer.json 路径（把 Qwen3 的 tokenizer.json 放在项目根）
+    let tokenizer_path = "./tokenizer.json";
+
+    // 显式错误映射
+    let tokenizer = Arc::new(
+        Tokenizer::from_file(tokenizer_path).map_err(|e| {
+            Box::<dyn std::error::Error>::from(format!("加载 tokenizer 失败: {}", e))
+        })?,
+    );
+    println!("已加载 tokenizer: {}", tokenizer_path);
+
+    let app_state = AppState::new(worker_count, batch_size, batch_timeout_ms, tokenizer.clone());
+
 
     let app = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
