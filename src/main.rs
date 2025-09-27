@@ -13,6 +13,7 @@ use tokio::net::TcpListener;
 use tokio::sync::oneshot;
 // ------------- 新增 import -------------
 use tokenizers::Tokenizer;
+use minijinja::{Environment, context};
 
 // ===== 批处理请求定义 =====
 
@@ -339,10 +340,11 @@ pub struct StreamChoice {
 struct AppState {
     batch_collector: Arc<BatchCollector>,
     tokenizer: Arc<Tokenizer>, // 新增：全局共享 tokenizer
+    chat_template: Arc<String>,   // 新增
 }
 
 impl AppState {
-    fn new(worker_count: usize, batch_size: usize, batch_timeout_ms: u64, tokenizer: Arc<Tokenizer>) -> Self {
+    fn new(worker_count: usize, batch_size: usize, batch_timeout_ms: u64, tokenizer: Arc<Tokenizer>, chat_template: Arc<String>,) -> Self {
         let (task_tx, task_rx) = channel::unbounded::<LLMTask>();
 
         // 创建批处理收集器
@@ -357,7 +359,7 @@ impl AppState {
             });
         }
 
-        AppState { batch_collector , tokenizer}
+        AppState { batch_collector , tokenizer,chat_template,}
     }
 }
 
@@ -370,13 +372,11 @@ async fn chat_completions(
     let request_id = format!("chatcmpl-{}", generate_id());
     let is_stream = request.stream.unwrap_or(false);
 
-    // 构造prompt
-    let prompt = request
-        .messages
-        .iter()
-        .map(|msg| format!("{}: {}", msg.role, msg.content))
-        .collect::<Vec<_>>()
-        .join("\n");
+    // 新写法：使用 chat_template 渲染
+    let prompt = match render_chat_template(&request.messages, &state.chat_template) {
+        Ok(p) => p,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
      // 分词（放在 spawn_blocking 避免阻塞 tokio 线程）
     let tokenizer_arc = state.tokenizer.clone();
     let prompt_clone = prompt.clone();
@@ -514,6 +514,18 @@ fn encode_prompt(tokenizer: &Tokenizer, prompt: &str) -> Result<Vec<u32>, String
         .map_err(|e| format!("tokenizer encode failed: {}", e))
         .map(|enc| enc.get_ids().to_vec())
 }
+fn render_chat_template(messages: &[ChatMessage], template_str: &str) -> Result<String, String> {
+    let mut env = Environment::new();
+    env.add_template("chat", template_str).map_err(|e| e.to_string())?;
+    let tmpl = env.get_template("chat").map_err(|e| e.to_string())?;
+
+    let ctx = context! {
+        messages => messages,
+    };
+
+    tmpl.render(ctx).map_err(|e| e.to_string())
+}
+
 
 
 // ===== 主函数 =====
@@ -540,9 +552,16 @@ pub async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Box::<dyn std::error::Error>::from(format!("加载 tokenizer 失败: {}", e))
         })?,
     );
+    // 加载 chat_template.jinja
+    let chat_template = Arc::new(
+        std::fs::read_to_string("./chat_template.jinja")
+            .map_err(|e| format!("加载 chat_template.jinja 失败: {}", e))?,
+    );
     println!("已加载 tokenizer: {}", tokenizer_path);
+    println!("已加载 chat_template: ./chat_template.jinja");
 
-    let app_state = AppState::new(worker_count, batch_size, batch_timeout_ms, tokenizer.clone());
+    let app_state = AppState::new
+    (worker_count, batch_size, batch_timeout_ms, tokenizer.clone(),chat_template.clone(),);
 
 
     let app = Router::new()

@@ -1,33 +1,42 @@
-use tokenizers::Tokenizer;
+use std::error::Error;
 use std::sync::Arc;
+use tokenizers::Tokenizer;
+use minijinja::Environment;
+use minijinja::context;
 
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tokenizer_path = "./tokenizer.json";
+fn main() -> Result<(), Box<dyn Error + Send + Sync>> {
+    let tokenizer = Arc::new(Tokenizer::from_file("./tokenizer.json")?);
+    let chat_template = std::fs::read_to_string("./chat_template.jinja")?;
 
-    // 使用 ? 来处理错误
-    let tokenizer = Arc::new(Tokenizer::from_file(tokenizer_path)?);
+    // 模拟一个对话
+    let messages = vec![
+        ("system", "You are a helpful assistant."),
+        ("user", "你好，世界！这是一次分词测试。"),
+    ];
 
-    let text = "你好，世界！这是一次分词测试。";
-    println!("文本: {}", text);
+    // 用 chat_template 渲染
+    let mut env = Environment::new();
+    let tmpl = env.template_from_str(&chat_template)?;
 
-    // 编码
-    let encoding = tokenizer.encode(text, true)?;
+    // 用 minijinja 的 context 宏传递 messages
+    let rendered = tmpl.render(context! {
+        messages => messages
+            .iter()
+            .map(|(role, content)| {
+                serde_json::json!({
+                    "role": role,
+                    "content": content
+                })
+            })
+            .collect::<Vec<_>>()
+    })?;
 
-    let token_ids = encoding.get_ids();
-    let token_strs = encoding.get_tokens();
+    println!("渲染后的 Prompt:\n{}", rendered);
 
-    println!("Token ID: {:?}", token_ids);
-
-    println!("Token 字符串:");
-    for (id, token) in token_ids.iter().zip(token_strs.iter()) {
-        // decode 传切片引用
-        let token_text = tokenizer.decode(&[*id], true)?;
-        println!("ID: {:<6} Token: {}", id, token_text);
-    }
-
-    // 整体 decode
-    let decoded_text = tokenizer.decode(token_ids, true)?;
-    println!("整体 decode: {}", decoded_text);
+    // 分词
+    let encoding = tokenizer.encode(rendered.clone(), true)?;
+    println!("Token IDs: {:?}", encoding.get_ids());
+    println!("Decode: {}", tokenizer.decode(encoding.get_ids(), true)?);
 
     Ok(())
 }
